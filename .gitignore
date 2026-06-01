@@ -1,0 +1,13 @@
+# Compiled binaries (sources are xips.cpp / ips/ips.cpp)
+/xips
+/ips/ips
+
+# Packaging build artifacts (produced by `make deb`)
+/build/
+/dist/
+/ips/build/
+/ips/dist/
+
+# Scratch / scratch test data
+txt.txt
+list.txt

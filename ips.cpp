@@ -1,4 +1,5 @@
 #include <iostream>
+#include <fstream>
 #include <string>
 #include <sstream>
 #include <vector>
@@ -7,6 +8,8 @@
 #include <algorithm>
 #include <iomanip>
 #include <cmath>
+#include <cstring>
+#include <unordered_set>
 
 // ips
 //
@@ -86,6 +89,87 @@ unsigned int SwapBytes(unsigned int original)
 {
 	return ((original & 0x000000ff) << 24) + ((original & 0x0000ff00) << 8) + ((original & 0x00ff0000) >> 8) + ((original & 0xff000000) >> 24);
 }
+
+bool is_private_ipv4(uint32_t addr) {
+	if ((addr & 0xFF000000) == 0x0A000000) return true;  // 10/8
+	if ((addr & 0xFFF00000) == 0xAC100000) return true;  // 172.16/12
+	if ((addr & 0xFFFF0000) == 0xC0A80000) return true;  // 192.168/16
+	if ((addr & 0xFF000000) == 0x7F000000) return true;  // 127/8
+	if ((addr & 0xFFFF0000) == 0xA9FE0000) return true;  // 169.254/16
+	return false;
+}
+
+bool is_private_ipv6(const sockaddr_in6& sa6) {
+	uint8_t b0 = sa6.sin6_addr.s6_addr[0];
+	uint8_t b1 = sa6.sin6_addr.s6_addr[1];
+	bool loopback = (sa6.sin6_addr.s6_addr[15] == 1);
+	for (int i = 0; i < 15 && loopback; i++)
+		if (sa6.sin6_addr.s6_addr[i] != 0) loopback = false;
+	if (loopback) return true;
+	if ((b0 & 0xFE) == 0xFC) return true;  // fc00::/7 unique local
+	if (b0 == 0xFE && (b1 & 0xC0) == 0x80) return true;  // fe80::/10 link local
+	return false;
+}
+
+bool is_link_local_ipv6(const sockaddr_in6& sa6) {
+	return sa6.sin6_addr.s6_addr[0] == 0xFE &&
+	       (sa6.sin6_addr.s6_addr[1] & 0xC0) == 0x80;
+}
+
+bool is_link_local_mac_ipv6(const sockaddr_in6& sa6) {
+	if (!is_link_local_ipv6(sa6)) return false;
+	// EUI-64: bytes 11-12 are FF:FE (MAC OUI/NIC split marker)
+	return sa6.sin6_addr.s6_addr[11] == 0xFF &&
+	       sa6.sin6_addr.s6_addr[12] == 0xFE;
+}
+
+bool is_v4mapped_ipv6(const sockaddr_in6& sa6) {
+	for (int i = 0; i < 10; i++)
+		if (sa6.sin6_addr.s6_addr[i] != 0) return false;
+	return sa6.sin6_addr.s6_addr[10] == 0xFF && sa6.sin6_addr.s6_addr[11] == 0xFF;
+}
+
+sockaddr_in extract_v4_from_mapped(const sockaddr_in6& sa6) {
+	struct sockaddr_in sa4;
+	memset(&sa4, 0, sizeof(sa4));
+	sa4.sin_family = AF_INET;
+	memcpy(&sa4.sin_addr.s_addr, &sa6.sin6_addr.s6_addr[12], 4);
+	return sa4;
+}
+
+bool is_6to4_ipv6(const sockaddr_in6& sa6) {
+	return sa6.sin6_addr.s6_addr[0] == 0x20 && sa6.sin6_addr.s6_addr[1] == 0x02;
+}
+
+sockaddr_in extract_v4_from_6to4(const sockaddr_in6& sa6) {
+	struct sockaddr_in sa4;
+	memset(&sa4, 0, sizeof(sa4));
+	sa4.sin_family = AF_INET;
+	memcpy(&sa4.sin_addr.s_addr, &sa6.sin6_addr.s6_addr[2], 4);
+	return sa4;
+}
+
+bool is_teredo_ipv6(const sockaddr_in6& sa6) {
+	return sa6.sin6_addr.s6_addr[0] == 0x20 && sa6.sin6_addr.s6_addr[1] == 0x01 &&
+	       sa6.sin6_addr.s6_addr[2] == 0x00 && sa6.sin6_addr.s6_addr[3] == 0x00;
+}
+
+sockaddr_in extract_v4_from_teredo(const sockaddr_in6& sa6) {
+	struct sockaddr_in sa4;
+	memset(&sa4, 0, sizeof(sa4));
+	sa4.sin_family = AF_INET;
+	// client IPv4 is in bytes 12-15, XOR'd with 0xFF
+	for (int i = 0; i < 4; i++)
+		((uint8_t*)&sa4.sin_addr.s_addr)[i] = sa6.sin6_addr.s6_addr[12 + i] ^ 0xFF;
+	return sa4;
+}
+
+struct SortableIP {
+	int family;        // 4 or 6
+	uint8_t bytes[16]; // 4 bytes for IPv4, 16 for IPv6
+	string key;        // normalized inet_ntop form for dedup
+	string display;    // what to print
+};
 
 void check_context_line_for_cisco_specific_match(string cisco_context_line, vector<string> &cisco_text_match) {
 	// ok, we spit out a stanza heading.  So - is this heading a...
@@ -221,7 +305,7 @@ int convertMaskv6(string value, sockaddr_in6 &mask) {
 	//int numbits = atoi(value.c_str());
 	int numbits = strtol(value.c_str(), NULL, 10);
 
-	if (numbits == 0 && value.c_str() != "0") {  // fucking string conversion using 0 as error
+	if (numbits == 0 && value != "0") {  // strtol uses 0 as error sentinel, but "0" is a valid mask
 		return 1;
 	}
 
@@ -820,7 +904,25 @@ int main(int argc, char* argv[]) {
    
 	bool mode_use_old_aton_behavior = false;
 
+	bool mode_count = false;
+	bool mode_private = false;
+	bool mode_public = false;
+	bool mode_masks = false;
+	bool mode_link_local = false;
+	bool mode_link_local_mac = false;
+	bool mode_v4mapped = false;
+	bool mode_6to4 = false;
+	bool mode_teredo = false;
+	bool mode_sort = false;
+	bool mode_unique = false;
+	unordered_set<string> seen_ips;
+	vector<SortableIP> sort_bucket;
+
+	vector<pair<sockaddr_in,sockaddr_in>> cidr_filter_v4;
+	vector<pair<sockaddr_in6,sockaddr_in6>> cidr_filter_v6;
+
 	std::string final_arg = "";
+	std::vector<std::string> input_files;
 
 	//parse some arguments.  Starting at 1 because 0 is "ips"
 	for ( int i = 1; i < argc; i++) {
@@ -968,14 +1070,96 @@ int main(int argc, char* argv[]) {
 			continue;
 		}
 
+		if (arg == "-f" || arg == "--file") {
+			if (i+1 < argc) {
+				input_files.push_back(argv[i+1]);
+				i++;
+				continue;
+			}
+		}
+
+		if (arg == "--count") {
+			mode_count = true;
+			mode_quiet = true;
+			continue;
+		}
+
+		if (arg == "--private") {
+			mode_private = true;
+			continue;
+		}
+
+		if (arg == "--public") {
+			mode_public = true;
+			continue;
+		}
+
+		if (arg == "--masks") {
+			mode_masks = true;
+			continue;
+		}
+
+		if (arg == "--link-local") {
+			mode_link_local = true;
+			continue;
+		}
+
+		if (arg == "--link-local-mac") {
+			mode_link_local_mac = true;
+			continue;
+		}
+
+		if (arg == "--v4mapped") {
+			mode_v4mapped = true;
+			continue;
+		}
+
+		if (arg == "--6to4") {
+			mode_6to4 = true;
+			continue;
+		}
+
+		if (arg == "--teredo") {
+			mode_teredo = true;
+			continue;
+		}
+
+		if (arg == "--sort") {
+			mode_sort = true;
+			continue;
+		}
+
+		if (arg == "--unique" || arg == "--uniq") {
+			mode_unique = true;
+			continue;
+		}
+
+		if (arg == "--cidr") {
+			if (i+1 < argc) {
+				string cidr_arg = argv[i+1];
+				i++;
+				struct sockaddr_in cs4, ce4;
+				struct sockaddr_in6 cs6, ce6;
+				string cp;
+				if (string_to_ipv4_range(false, "", "", cidr_arg, cp, cs4, ce4) == 0) {
+					cidr_filter_v4.push_back({cs4, ce4});
+				} else if (string_to_ipv6_range("", "", cidr_arg, cp, cs6, ce6) == 0) {
+					cidr_filter_v6.push_back({cs6, ce6});
+				} else {
+					cerr << "ips: --cidr: cannot parse range: " << cidr_arg << endl;
+				}
+			}
+			continue;
+		}
+
 		if (arg == "-v" || arg == "--version") {
-			cout << "ips v0.7  5 July 2017" << endl
+			cout << "ips v0.8  11 May 2026" << endl
 				 << "by Eli Fulkerson.  See http://www.elifulkerson.com for updates" << endl << flush;
 			return 0;
 		}
 
 		if (arg == "-h" || arg == "--help" || arg == "--usage" || arg == "?" || arg == "/?" || arg == "-?" || arg == "/h" || arg == "/H") {
-			cout << "Syntax: your_command | ips [-4] [-6] [-v] [-%] [-s] [-q] [-c lines] [-v]  ip (or range)" << endl
+			cout << "Syntax: your_command | ips [-4] [-6] [-v] [-%] [-s] [-q] [-c lines] [-f file] [ip or range]" << endl
 				<< endl
 				<< "Eats STDIN, outputs lines containing IP addresses or matching specified IP or range."
 				<< endl
@@ -988,13 +1172,26 @@ int main(int argc, char* argv[]) {
 				<< " -q     : quiet, no output" << endl
 				<< " -c X   : print X lines of context.  (Also --context)" << endl
                 << " -b     : 'basic' mode - one ip per line, no context.  (--basic)" << endl
-                << " -x     : match 'hex ipv4' addresses, for isntance 'FFFFFFFF'" << endl
+                << " -x     : match 'hex ipv4' addresses, for instance 'FFFFFFFF'" << endl
 				<< " -v     : Display version information" << endl
 				<< " --cisco:  Include the last non-indented line when printing context" << endl
 				<< " --aton : Use \"old\" inet_aton behavior.  For instance, 10.5 is another name for 10.0.0.5" << endl
+				<< " -f file: read input from file instead of stdin (also --file; may be repeated)" << endl
+				<< " --count  : count matching IPs and print total instead of outputting them" << endl
+				<< " --private: only output private/RFC1918 addresses" << endl
+				<< " --public : only output non-private addresses" << endl
+				<< " --masks  : allow subnet masks to be shown as standalone IPs (suppressed by default)" << endl
+				<< " --link-local    : only output IPv6 link-local addresses (fe80::/10)" << endl
+				<< " --link-local-mac: only output link-local addresses with EUI-64 MAC-derived IDs" << endl
+				<< " --v4mapped : only output IPv4-mapped IPv6 addresses (::ffff:x.x.x.x)" << endl
+				<< " --6to4     : only output 6to4 IPv6 addresses (2002::/16; embeds IPv4 in bytes 2-5)" << endl
+				<< " --teredo   : only output Teredo IPv6 addresses (2001::/32; embeds client IPv4 in bytes 12-15 XOR 0xFF)" << endl
+				<< " --sort     : collect all matching IPs and output in numeric order (IPv4 then IPv6)" << endl
+				<< " --unique   : deduplicate IPs in appearance order (alias: --uniq)" << endl
+				<< " --cidr R : only output IPs within CIDR R (may be repeated, matches any)" << endl
 				<< endl
 				<< "Shorthand:" << endl
-				<< " A,-B,-C,-D,-E    : Shorthand to match addresses in the classical IP address classes.  Also --multicast, --experimental for D and E" << endl
+				<< " -A,-B,-C,-D,-E    : Shorthand to match addresses in the classical IP address classes.  Also --multicast, --experimental for D and E" << endl
 				<< " --loopback       : Shorthand to match 127.0.0.0 through 127.255.255.255" << endl
 				<< " --10,--192,--172 : Shorthand to match RFC 1918 address ranges" << endl
 				<< endl
@@ -1005,7 +1202,11 @@ int main(int argc, char* argv[]) {
 				<< " 192.168.1.1/C" << endl
 				<< " '192.168.1.1 255.255.255.0'" << endl
 				<< " 192.168.1.5-15" << endl
-				
+				<< endl
+				<< "Exit status (like grep):" << endl
+				<< " 0 : at least one matching IP was found" << endl
+				<< " 1 : no matching IP was found" << endl
+
 				<< flush;
 
 
@@ -1072,20 +1273,12 @@ int main(int argc, char* argv[]) {
 	
 	vector<string> cisco_text_match;
 
-	while (true) {
+	auto process_stream = [&](std::istream& stream) {
+	while (getline(stream, input)) {
 
-		getline(cin, input);
-
-		if (!cin) {
-			// @@ it would be nice to have this work, but with ranges in play - a single range can match multiple times
-			// ... and then have their output suppressed, so you don't get a real number_of_matches anymore.
-			if (number_of_matches > 0) {
-				return 1;
-			} else {
-				return 0;
-			}
-			
-			//return number_of_matches;
+		// strip Windows-style \r in case input came from a CRLF file or pipe
+		if (!input.empty() && input.back() == '\r') {
+			input.pop_back();
 		}
 
         current_line++;
@@ -1286,9 +1479,10 @@ int main(int argc, char* argv[]) {
             }
 
             // Early rejection of some strings on the theory that this is faster than inet_pton
-            
-            // if we don't have either a . or a : or if we have both, its not a valid IP address
-            if ((countdot == 0 && countcolon == 0) || (countdot != 0 && countcolon != 0)) {
+
+            // if we don't have either a . or a :, its not a valid IP address
+            // (both dots and colons is allowed for v4-in-IPv6 mixed notation like ::ffff:10.0.0.1)
+            if (countdot == 0 && countcolon == 0) {
                 continue;
             }
 
@@ -1322,20 +1516,63 @@ int main(int argc, char* argv[]) {
 					(mode_use_old_aton_behavior && inet_aton(word.c_str(), &(sa.sin_addr)))) {
 
 					// ok, its an ip address.  BUT
+					// Suppress 255.x.x.x subnet masks (/8 and narrower) by default.
+					// Lower masks (128/192/224/240.0.0.0 = /1-/7) are also valid host addresses
+					// and are left unsuppressed to avoid breaking class-range filters.
+					if (!mode_masks && word.size() >= 4 && word.substr(0, 4) == "255." && isMaskv4(word)) continue;
+
 					if ((mode_range || mode_range_shortcut) && (betweenIPv4(sa, ipv4_range_start, ipv4_range_end) == false)) {
 						// well, we were an IP address, but we're looking for a range and we didn't match the range.
 						continue;
 					}
 
-					format_output(mode_line_number, mode_quiet, mode_context, mode_context_amount, context_countdown, last_context_line, current_line, context_lines, word, mode_cisco_context_line, cisco_context_line, cisco_context_number, cisco_in_stanza, cisco_text_match);
+					if (mode_private && !is_private_ipv4(SwapBytes(sa.sin_addr.s_addr))) continue;
+					if (mode_public && is_private_ipv4(SwapBytes(sa.sin_addr.s_addr))) continue;
+					if (mode_link_local || mode_link_local_mac) continue;
+					if (!cidr_filter_v4.empty()) {
+						bool in_cidr = false;
+						for (const auto& cf : cidr_filter_v4) {
+							if (betweenIPv4(sa, cf.first, cf.second)) { in_cidr = true; break; }
+						}
+						if (!in_cidr) continue;
+					}
+
+					if (mode_sort || mode_unique) {
+						char nbuf[INET_ADDRSTRLEN];
+						inet_ntop(AF_INET, &sa.sin_addr, nbuf, INET_ADDRSTRLEN);
+						string norm(nbuf);
+						if (mode_unique && !mode_sort) {
+							if (seen_ips.count(norm)) continue;
+							seen_ips.insert(norm);
+							if (!mode_quiet) cout << norm << "\n";
+						} else {
+							SortableIP sip; sip.family = 4; memset(sip.bytes, 0, 16);
+							memcpy(sip.bytes, &sa.sin_addr.s_addr, 4);
+							sip.key = norm; sip.display = norm;
+							sort_bucket.push_back(sip);
+						}
+						number_of_matches++;
+						continue;
+					}
+
+					// In basic mode, if the next token is a subnet mask, output "ip mask" together
+					// and skip the mask so it isn't printed again as a standalone IP.
+					if (!mode_context && (i+1) < (int)words.size() && isMaskv4(words[i+1])) {
+						format_output(mode_line_number, mode_quiet, mode_context, mode_context_amount, context_countdown, last_context_line, current_line, context_lines, currword + " " + words[i+1], mode_cisco_context_line, cisco_context_line, cisco_context_number, cisco_in_stanza, cisco_text_match);
+						number_of_matches++;
+						i++;  // skip the mask token
+						continue;
+					}
+
+					format_output(mode_line_number, mode_quiet, mode_context, mode_context_amount, context_countdown, last_context_line, current_line, context_lines, currword, mode_cisco_context_line, cisco_context_line, cisco_context_number, cisco_in_stanza, cisco_text_match);
 
                     number_of_matches++;
 					continue;
 				}
-				
+
 			}
 
-			if (mode_ipv6 && range_type != 4 && countcolon != 0) {
+			if (mode_ipv6 && countcolon != 0) {
 
 				struct sockaddr_in6 sa6;
 
@@ -1359,11 +1596,74 @@ int main(int argc, char* argv[]) {
 
 					if (inet_pton(AF_INET6, ipparts[0].c_str(), &(sa6.sin6_addr))) {
 
-						if ((mode_range || mode_range_shortcut) && (betweenIPv6(sa6, ipv6_range_start, ipv6_range_end) == false)) {
-							continue;
+						bool is_mapped = is_v4mapped_ipv6(sa6);
+						bool is_6to4   = !is_mapped && is_6to4_ipv6(sa6);
+						bool is_teredo = !is_mapped && !is_6to4 && is_teredo_ipv6(sa6);
+						bool has_embedded_v4 = is_mapped || is_6to4 || is_teredo;
+
+						if (!has_embedded_v4 && range_type == 4) continue;
+
+						if (mode_v4mapped || mode_6to4 || mode_teredo) {
+							bool matches = (mode_v4mapped && is_mapped) ||
+							               (mode_6to4   && is_6to4)   ||
+							               (mode_teredo  && is_teredo);
+							if (!matches) continue;
 						}
 
+						if (has_embedded_v4) {
+							struct sockaddr_in sa4;
+							if (is_mapped)      sa4 = extract_v4_from_mapped(sa6);
+							else if (is_6to4)   sa4 = extract_v4_from_6to4(sa6);
+							else                sa4 = extract_v4_from_teredo(sa6);
+							if ((mode_range || mode_range_shortcut) && range_type == 4) {
+								if (!betweenIPv4(sa4, ipv4_range_start, ipv4_range_end)) continue;
+							} else if ((mode_range || mode_range_shortcut) && range_type == 6) {
+								if (!betweenIPv6(sa6, ipv6_range_start, ipv6_range_end)) continue;
+							}
+							if (mode_private && !is_private_ipv4(SwapBytes(sa4.sin_addr.s_addr))) continue;
+							if (mode_public && is_private_ipv4(SwapBytes(sa4.sin_addr.s_addr))) continue;
+							if (mode_link_local || mode_link_local_mac) continue;
+							if (!cidr_filter_v4.empty() || !cidr_filter_v6.empty()) {
+								bool in_cidr = false;
+								for (const auto& cf : cidr_filter_v4)
+									if (betweenIPv4(sa4, cf.first, cf.second)) { in_cidr = true; break; }
+								if (!in_cidr)
+									for (const auto& cf : cidr_filter_v6)
+										if (betweenIPv6(sa6, cf.first, cf.second)) { in_cidr = true; break; }
+								if (!in_cidr) continue;
+							}
+						} else {
+							if ((mode_range || mode_range_shortcut) && !betweenIPv6(sa6, ipv6_range_start, ipv6_range_end)) continue;
+							if (mode_private && !is_private_ipv6(sa6)) continue;
+							if (mode_public && is_private_ipv6(sa6)) continue;
+							if (mode_link_local && !is_link_local_ipv6(sa6)) continue;
+							if (mode_link_local_mac && !is_link_local_mac_ipv6(sa6)) continue;
+							if (!cidr_filter_v4.empty() || !cidr_filter_v6.empty()) {
+								bool in_cidr = false;
+								for (const auto& cf : cidr_filter_v6)
+									if (betweenIPv6(sa6, cf.first, cf.second)) { in_cidr = true; break; }
+								if (!in_cidr) continue;
+							}
+						}
 
+						if (mode_sort || mode_unique) {
+							string display = mode_ipv6_include_scope ? word : string(ipparts[0]);
+							char nbuf[INET6_ADDRSTRLEN];
+							inet_ntop(AF_INET6, &sa6.sin6_addr, nbuf, INET6_ADDRSTRLEN);
+							string norm(nbuf);
+							if (mode_unique && !mode_sort) {
+								if (seen_ips.count(norm)) continue;
+								seen_ips.insert(norm);
+								if (!mode_quiet) cout << display << "\n";
+							} else {
+								SortableIP sip; sip.family = 6; memset(sip.bytes, 0, 16);
+								memcpy(sip.bytes, sa6.sin6_addr.s6_addr, 16);
+								sip.key = norm; sip.display = display;
+								sort_bucket.push_back(sip);
+							}
+							number_of_matches++;
+							continue;
+						}
 						if (mode_ipv6_include_scope) {
 							format_output(mode_line_number, mode_quiet, mode_context, mode_context_amount, context_countdown, last_context_line, current_line, context_lines, word, mode_cisco_context_line, cisco_context_line, cisco_context_number, cisco_in_stanza,cisco_text_match);
 						} else {
@@ -1377,11 +1677,74 @@ int main(int argc, char* argv[]) {
 				} else {
 					if (inet_pton(AF_INET6, word.c_str(), &(sa6.sin6_addr))) {
 
-						if ((mode_range || mode_range_shortcut) && (betweenIPv6(sa6, ipv6_range_start, ipv6_range_end) == false)) {
-							continue;
+						bool is_mapped = is_v4mapped_ipv6(sa6);
+						bool is_6to4   = !is_mapped && is_6to4_ipv6(sa6);
+						bool is_teredo = !is_mapped && !is_6to4 && is_teredo_ipv6(sa6);
+						bool has_embedded_v4 = is_mapped || is_6to4 || is_teredo;
+
+						if (!has_embedded_v4 && range_type == 4) continue;
+
+						if (mode_v4mapped || mode_6to4 || mode_teredo) {
+							bool matches = (mode_v4mapped && is_mapped) ||
+							               (mode_6to4   && is_6to4)   ||
+							               (mode_teredo  && is_teredo);
+							if (!matches) continue;
 						}
 
-						format_output(mode_line_number, mode_quiet, mode_context, mode_context_amount, context_countdown, last_context_line, current_line, context_lines, word, mode_cisco_context_line, cisco_context_line, cisco_context_number, cisco_in_stanza, cisco_text_match);
+						if (has_embedded_v4) {
+							struct sockaddr_in sa4;
+							if (is_mapped)      sa4 = extract_v4_from_mapped(sa6);
+							else if (is_6to4)   sa4 = extract_v4_from_6to4(sa6);
+							else                sa4 = extract_v4_from_teredo(sa6);
+							if ((mode_range || mode_range_shortcut) && range_type == 4) {
+								if (!betweenIPv4(sa4, ipv4_range_start, ipv4_range_end)) continue;
+							} else if ((mode_range || mode_range_shortcut) && range_type == 6) {
+								if (!betweenIPv6(sa6, ipv6_range_start, ipv6_range_end)) continue;
+							}
+							if (mode_private && !is_private_ipv4(SwapBytes(sa4.sin_addr.s_addr))) continue;
+							if (mode_public && is_private_ipv4(SwapBytes(sa4.sin_addr.s_addr))) continue;
+							if (mode_link_local || mode_link_local_mac) continue;
+							if (!cidr_filter_v4.empty() || !cidr_filter_v6.empty()) {
+								bool in_cidr = false;
+								for (const auto& cf : cidr_filter_v4)
+									if (betweenIPv4(sa4, cf.first, cf.second)) { in_cidr = true; break; }
+								if (!in_cidr)
+									for (const auto& cf : cidr_filter_v6)
+										if (betweenIPv6(sa6, cf.first, cf.second)) { in_cidr = true; break; }
+								if (!in_cidr) continue;
+							}
+						} else {
+							if ((mode_range || mode_range_shortcut) && !betweenIPv6(sa6, ipv6_range_start, ipv6_range_end)) continue;
+							if (mode_private && !is_private_ipv6(sa6)) continue;
+							if (mode_public && is_private_ipv6(sa6)) continue;
+							if (mode_link_local && !is_link_local_ipv6(sa6)) continue;
+							if (mode_link_local_mac && !is_link_local_mac_ipv6(sa6)) continue;
+							if (!cidr_filter_v4.empty() || !cidr_filter_v6.empty()) {
+								bool in_cidr = false;
+								for (const auto& cf : cidr_filter_v6)
+									if (betweenIPv6(sa6, cf.first, cf.second)) { in_cidr = true; break; }
+								if (!in_cidr) continue;
+							}
+						}
+
+						if (mode_sort || mode_unique) {
+							char nbuf[INET6_ADDRSTRLEN];
+							inet_ntop(AF_INET6, &sa6.sin6_addr, nbuf, INET6_ADDRSTRLEN);
+							string norm(nbuf);
+							if (mode_unique && !mode_sort) {
+								if (seen_ips.count(norm)) continue;
+								seen_ips.insert(norm);
+								if (!mode_quiet) cout << currword << "\n";
+							} else {
+								SortableIP sip; sip.family = 6; memset(sip.bytes, 0, 16);
+								memcpy(sip.bytes, sa6.sin6_addr.s6_addr, 16);
+								sip.key = norm; sip.display = currword;
+								sort_bucket.push_back(sip);
+							}
+							number_of_matches++;
+							continue;
+						}
+						format_output(mode_line_number, mode_quiet, mode_context, mode_context_amount, context_countdown, last_context_line, current_line, context_lines, currword, mode_cisco_context_line, cisco_context_line, cisco_context_number, cisco_in_stanza, cisco_text_match);
 
                         number_of_matches++;
 						continue;
@@ -1409,18 +1772,48 @@ int main(int argc, char* argv[]) {
             context_countdown = 0;
         }
 
-        /*
-		if (!cin) {
-			// @@ it would be nice to have this work, but with ranges in play - a single range can match multiple times
-			// ... and then have their output suppressed, so you don't get a real number_of_matches anymore.
-			if (number_of_matches > 0) {
-				return 1;
-			} else {
-				return 0;
-			}
-			
-			//return number_of_matches;
-		}
-		*/
 	}
+	}; // end process_stream
+
+	if (input_files.empty()) {
+		process_stream(cin);
+	} else {
+		for (const std::string& filename : input_files) {
+			std::ifstream f(filename);
+			if (!f.is_open()) {
+				cerr << "ips: cannot open file: " << filename << endl;
+				continue;
+			}
+			process_stream(f);
+		}
+	}
+
+	if (mode_sort) {
+		sort(sort_bucket.begin(), sort_bucket.end(), [](const SortableIP& a, const SortableIP& b) {
+			if (a.family != b.family) return a.family < b.family;
+			return memcmp(a.bytes, b.bytes, 16) < 0;
+		});
+		if (mode_unique) {
+			auto last = unique(sort_bucket.begin(), sort_bucket.end(), [](const SortableIP& a, const SortableIP& b) {
+				return a.key == b.key;
+			});
+			sort_bucket.erase(last, sort_bucket.end());
+		}
+		if (!mode_quiet) {
+			for (const auto& sip : sort_bucket) {
+				cout << sip.display << "\n";
+			}
+		}
+		number_of_matches = (int)sort_bucket.size();
+	}
+
+	if (mode_count) {
+		cout << number_of_matches << endl;
+	}
+
+	// grep convention: exit 0 if any matches were found, 1 if none.
+	if (number_of_matches > 0) {
+		return 0;
+	}
+	return 1;
 }

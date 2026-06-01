@@ -1,0 +1,265 @@
+.TH IPS 1 "May 2026" "ips v0.8" "User Commands"
+.SH NAME
+ips \- grep for IP addresses
+.SH SYNOPSIS
+.B ips
+.RB [ \-4 ]
+.RB [ \-6 ]
+.RB [ \-v ]
+.RB [ \-% ]
+.RB [ \-s ]
+.RB [ \-q ]
+.RB [ \-c
+.IR lines ]
+.RB [ \-f
+.IR file ]
+.RI [ "ip or range" ]
+.PP
+.IR your_command " | " ips
+.RI [ options ]
+.RI [ "ip or range" ]
+.SH DESCRIPTION
+.B ips
+reads arbitrary text from standard input (or from files) and
+.B finds
+the IP addresses in it.
+By default it behaves like
+.BR grep (1):
+it prints the lines that contain an IP address.
+Supplying an IP, range, subnet, or address category as a filter restricts
+matching to those addresses.
+The output can be reshaped into basic one-per-line form, annotated with line
+numbers or context, counted, sorted, or deduplicated.
+Both IPv4 and IPv6 are supported.
+.PP
+.B ips
+is the extractor counterpart to
+.BR xips (1),
+which
+.I transforms
+addresses you already have (expanding ranges, summarizing into CIDR, converting
+formats).
+.B ips
+pulls addresses
+.I out
+of surrounding text.
+.SH OPTIONS
+.SS "Address family"
+.TP
+.B \-4
+Match IPv4 addresses only.
+.TP
+.B \-6
+Match IPv6 addresses only.
+.TP
+.B \-%
+Include the IPv6 scope (zone id) when matching.
+.SS "Matching behavior"
+.TP
+.B \-s
+Strict \(em require IPs to be surrounded by whitespace.
+.TP
+.B \-x
+Match "hex IPv4" addresses, for instance
+.IR FFFFFFFF .
+.TP
+.B \-\-aton
+Use "old"
+.BR inet_aton (3)
+behavior; for instance,
+.I 10.5
+is another name for
+.IR 10.0.0.5 .
+.TP
+.B \-\-masks
+Allow subnet masks to be shown as standalone IPs (suppressed by default).
+.SS "Output shaping"
+.TP
+.BR \-b ", " \-\-basic
+Basic mode \(em one IP per line, no surrounding context.
+.TP
+.B \-n
+Output line numbers.
+.TP
+.B \-q
+Quiet \(em produce no output (use with the exit status).
+.TP
+.BI \-c " X" "\fR, \fB\-\-context " X
+Print
+.I X
+lines of context around each match.
+.TP
+.B \-\-cisco
+When printing context, also include the last non-indented line (e.g. the
+Cisco configuration section header).
+.TP
+.B \-\-count
+Count matching IPs and print the total instead of listing them.
+.TP
+.B \-\-sort
+Collect all matching IPs and output them in numeric order (IPv4 then IPv6).
+.TP
+.BR \-\-unique ", " \-\-uniq
+Deduplicate IPs in order of appearance.
+.SS "Filtering by category"
+.TP
+.B \-\-private
+Only output private / RFC1918 addresses.
+.TP
+.B \-\-public
+Only output non-private addresses.
+.TP
+.BI \-\-cidr " R"
+Only output IPs within CIDR
+.I R
+(may be repeated; matches any).
+.TP
+.B \-\-link\-local
+Only IPv6 link-local addresses
+.RB ( fe80::/10 ).
+.TP
+.B \-\-link\-local\-mac
+Only link-local addresses with EUI-64 MAC-derived interface IDs.
+.TP
+.B \-\-v4mapped
+Only IPv4-mapped IPv6 addresses
+.RB ( ::ffff:x.x.x.x ).
+.TP
+.B \-\-6to4
+Only 6to4 IPv6 addresses
+.RB ( 2002::/16 ;
+embeds IPv4 in bytes 2\(en5).
+.TP
+.B \-\-teredo
+Only Teredo IPv6 addresses
+.RB ( 2001::/32 ;
+embeds the client IPv4 in bytes 12\(en15 XOR 0xFF).
+.SS "Input and miscellaneous"
+.TP
+.BI \-f " file" "\fR, \fB\-\-file " file
+Read input from a file instead of stdin (may be repeated).
+.TP
+.B \-v
+Display version information.
+.SH "SHORTHAND MATCHERS"
+.TP
+.BR \-A ", " \-B ", " \-C
+Match the classical Class A, B, or C address ranges.
+.TP
+.BR \-D ", " \-\-multicast
+Match Class D (multicast) addresses.
+.TP
+.BR \-E ", " \-\-experimental
+Match Class E (experimental) addresses.
+.TP
+.B \-\-loopback
+Match 127.0.0.0 through 127.255.255.255.
+.TP
+.BR \-\-10 ", " \-\-172 ", " \-\-192
+Match the RFC 1918 ranges 10.0.0.0/8, 172.16.0.0/12, and 192.168.0.0/16.
+.SH "FILTER ARGUMENT SYNTAX"
+A trailing filter argument (or a
+.B \-\-cidr
+value) may be any of:
+.TP
+.B 192.168.1.1
+A single address.
+.TP
+.B 192.168.1.1\-192.168.1.255
+An inclusive hyphenated range.
+.TP
+.B 192.168.1.0/24
+A CIDR subnet.
+.TP
+.B 192.168.1.1/C
+Class A/B/C shorthand prefix.
+.TP
+.B '192.168.1.1 255.255.255.0'
+An address with a dotted subnet mask.
+.TP
+.B 192.168.1.5\-15
+A short hyphenated range.
+.SH "EXIT STATUS"
+.B ips
+follows
+.BR grep (1)
+conventions:
+.TP
+.B 0
+At least one matching IP was found.
+.TP
+.B 1
+No matching IP was found.
+.PP
+This makes
+.B ips
+convenient in shell conditionals, e.g.
+.RB ` "if ips \-q ...; then" '.
+.SH EXAMPLES
+Grep lines that contain an IP:
+.RS
+.nf
+$ printf "server 10.0.0.5 up\\nno ip here\\ngateway 192.168.1.1\\n" | ips
+server 10.0.0.5 up
+gateway 192.168.1.1
+.fi
+.RE
+.PP
+Basic mode \(em one IP per line:
+.RS
+.nf
+$ printf "two ips 10.0.0.5 and 8.8.8.8 here\\n" | ips \-b
+10.0.0.5
+8.8.8.8
+.fi
+.RE
+.PP
+Show line numbers:
+.RS
+.nf
+$ printf "a 1.2.3.4\\nb nothing\\nc 5.6.7.8\\n" | ips \-n
+     1  a 1.2.3.4
+     3  c 5.6.7.8
+.fi
+.RE
+.PP
+Match only a CIDR:
+.RS
+.nf
+$ printf "10.0.0.5\\n192.168.1.1\\n8.8.8.8\\n" | ips \-\-cidr 10.0.0.0/8 \-b
+10.0.0.5
+.fi
+.RE
+.PP
+Count matches:
+.RS
+.nf
+$ printf "10.0.0.5 10.0.0.6\\n8.8.8.8\\n" | ips \-\-count
+3
+.fi
+.RE
+.PP
+Filter to private addresses:
+.RS
+.nf
+$ printf "10.0.0.5\\n8.8.8.8\\n192.168.1.1\\n" | ips \-\-private \-b
+10.0.0.5
+192.168.1.1
+.fi
+.RE
+.PP
+Use the exit status in a script:
+.RS
+.nf
+$ printf "no ips here\\n" | ips \-q; echo "exit=$?"
+exit=1
+.fi
+.RE
+.SH "SEE ALSO"
+.BR xips (1)
+\(em expand, summarize, sort, and convert IP addresses you already have.
+.PP
+.UR http://www.elifulkerson.com
+.UE
+.SH AUTHOR
+Written by Eli Fulkerson.
